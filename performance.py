@@ -6,6 +6,7 @@
 @Time: 2021/4/1 11:48
 """
 import os
+import gc
 import json
 import torch
 import argparse
@@ -20,6 +21,7 @@ from sklearn.preprocessing import normalize
 # from bert4keras.models import build_bert_model
 # from bert4keras.tokenizers import Tokenizer
 from w3lib.html import remove_tags
+from transformers import BertTokenizer, BertModel
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--data-dir', default='europarl/train_data.pkl', type=str)
@@ -42,62 +44,63 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 # using pre-trained model to compute the sentence similarity
-# class Similarity():
-#     def __init__(self, config_path, checkpoint_path, dict_path):
-#         self.model1 = build_bert_model(config_path, checkpoint_path, with_pool=True)
-#         self.model = keras.Model(inputs=self.model1.input,
-#                                  outputs=self.model1.get_layer('Encoder-11-FeedForward-Norm').output)
-#         # build tokenizer
-#         self.tokenizer = Tokenizer(dict_path, do_lower_case=True)
-#
-#     def compute_similarity(self, real, predicted):
-#         token_ids1, segment_ids1 = [], []
-#         token_ids2, segment_ids2 = [], []
-#         score = []
-#
-#         for (sent1, sent2) in zip(real, predicted):
-#             sent1 = remove_tags(sent1)
-#             sent2 = remove_tags(sent2)
-#
-#             ids1, sids1 = self.tokenizer.encode(sent1)
-#             ids2, sids2 = self.tokenizer.encode(sent2)
-#
-#             token_ids1.append(ids1)
-#             token_ids2.append(ids2)
-#             segment_ids1.append(sids1)
-#             segment_ids2.append(sids2)
-#
-#         token_ids1 = keras.preprocessing.sequence.pad_sequences(token_ids1, maxlen=32, padding='post')
-#         token_ids2 = keras.preprocessing.sequence.pad_sequences(token_ids2, maxlen=32, padding='post')
-#
-#         segment_ids1 = keras.preprocessing.sequence.pad_sequences(segment_ids1, maxlen=32, padding='post')
-#         segment_ids2 = keras.preprocessing.sequence.pad_sequences(segment_ids2, maxlen=32, padding='post')
-#
-#         vector1 = self.model.predict([token_ids1, segment_ids1])
-#         vector2 = self.model.predict([token_ids2, segment_ids2])
-#
-#         vector1 = np.sum(vector1, axis=1)
-#         vector2 = np.sum(vector2, axis=1)
-#
-#         vector1 = normalize(vector1, axis=0, norm='max')
-#         vector2 = normalize(vector2, axis=0, norm='max')
-#
-#         dot = np.diag(np.matmul(vector1, vector2.T))  # a*b
-#         a = np.diag(np.matmul(vector1, vector1.T))  # a*a
-#         b = np.diag(np.matmul(vector2, vector2.T))
-#
-#         a = np.sqrt(a)
-#         b = np.sqrt(b)
-#
-#         output = dot / (a * b)
-#         score = output.tolist()
-#
-#         return score
+class Similarity():
+    def __init__(self):
+        self.tokenizer = BertTokenizer.from_pretrained('bert-large-cased')
+        self.model = BertModel.from_pretrained("bert-large-cased", device_map="cuda")
+
+    def normalize_tensor(self, pooled):
+        pooled_normalized = torch.div(pooled, torch.max(pooled, dim=-1, keepdim=True).values)
+        pooled_normalized = torch.nn.functional.normalize(pooled_normalized, dim=-1)
+
+        return pooled_normalized
+
+    def compute_similarity(self, real, predicted):
+        full_len = len(real)
+        batch_amount = 10
+        batch_size = int(full_len / batch_amount)
+        matmul_res = 0
+        for i in tqdm(range(batch_amount)):
+            stop = min((i + 1) * batch_size, full_len)
+
+            batch_real = real[i * batch_size : stop]
+            batch_predicted = predicted[i * batch_size : stop]
+
+            encoded_real = self.tokenizer(batch_real, return_tensors='pt', padding=True, truncation=True).to('cuda')
+            encoded_predicted = self.tokenizer(batch_predicted, return_tensors='pt', padding=True, truncation=True).to('cuda')
+
+            output_real = self.model(**encoded_real)
+            output_predicted = self.model(**encoded_predicted)
+
+            # pooled_real = output_real['pooler_output']
+            pooled_real = output_real['last_hidden_state']
+            pooled_real = torch.sum(pooled_real, dim=1)
+            pooled_real_normalized = self.normalize_tensor(pooled_real)
+            pooled_real_normalized = torch.unsqueeze(pooled_real_normalized, 1)
+
+            # pooled_predicted = output_predicted['pooler_output']
+            pooled_predicted = output_predicted['last_hidden_state']
+            pooled_predicted = torch.sum(pooled_predicted, dim=1)
+            pooled_predicted_normalized = self.normalize_tensor(pooled_predicted)
+            pooled_predicted_normalized = torch.unsqueeze(pooled_predicted_normalized, 2)
+
+            addent = torch.sum(torch.bmm(pooled_real_normalized, pooled_predicted_normalized))
+            matmul_res += addent
+
+        matmul_res = matmul_res / full_len
+        gc.collect()
+    
+        return matmul_res.cpu()
 
 
 def performance(args, SNR, net):
-    # similarity = Similarity(args.bert_config_path, args.bert_checkpoint_path, args.bert_dict_path)
-    bleu_score_1gram = BleuScore(1, 0, 0, 0)
+    similarity = Similarity()
+    bleu_scores_arr = [
+            BleuScore(1, 0, 0, 0),
+            BleuScore(0, 1, 0, 0),
+            BleuScore(0, 0, 1, 0),
+            BleuScore(0, 0, 0, 1)
+        ]
 
     test_eur = EurDataset('test')
     test_iterator = DataLoader(test_eur, batch_size=args.batch_size, num_workers=0,
@@ -137,30 +140,31 @@ def performance(args, SNR, net):
                 Tx_word.append(word)
                 Rx_word.append(target_word)
 
-            bleu_score = []
+            bleu_scores = [[] for i in range(len(bleu_scores_arr))]
             sim_score = []
             for sent1, sent2 in zip(Tx_word, Rx_word):
                 # 1-gram
-                bleu_score.append(bleu_score_1gram.compute_blue_score(sent1, sent2)) # 7*num_sent
-                # sim_score.append(similarity.compute_similarity(sent1, sent2)) # 7*num_sent
-            bleu_score = np.array(bleu_score)
-            bleu_score = np.mean(bleu_score, axis=1)
+                for i in range(len(bleu_scores_arr)):
+                    bleu_scores[i].append(bleu_scores_arr[i].compute_blue_score(sent1, sent2)) # 7*num_sent
+                sim_score.append(similarity.compute_similarity(sent1, sent2)) # 7*num_sent
+                print(f'Finished one similarity, {sim_score}')
+            bleu_score = np.array(bleu_scores)
+            bleu_score = np.mean(bleu_score, axis=-1)
             score.append(bleu_score)
 
-            # sim_score = np.array(sim_score)
-            # sim_score = np.mean(sim_score, axis=1)
-            # score2.append(sim_score)
+            sim_score = np.array(sim_score)
+            score2.append(sim_score)
 
     score1 = np.mean(np.array(score), axis=0)
-    # score2 = np.mean(np.array(score2), axis=0)
+    score2 = np.mean(np.array(score2), axis=0)
 
-    return score1#, score2
+    return score1, score2
 
 if __name__ == '__main__':
     args = parser.parse_args()
     SNR = [0,3,6,9,12,15,18]
 
-    args.vocab_file = '/import/antennas/Datasets/hx301/' + args.vocab_file
+    args.vocab_file = './data/' + args.vocab_file
     vocab = json.load(open(args.vocab_file, 'rb'))
     token_to_idx = vocab['token_to_idx']
     idx_to_token = dict(zip(token_to_idx.values(), token_to_idx.keys()))
@@ -187,7 +191,7 @@ if __name__ == '__main__':
     deepsc.load_state_dict(checkpoint)
     print('model load!')
 
-    bleu_score = performance(args, SNR, deepsc)
-    print(bleu_score)
+    print(args.channel)
+    bleu_score, sim_score = performance(args, SNR, deepsc)
+    print(f"Bleu and sim scores for channel {args.channel}: {bleu_score}, {sim_score}")
 
-    #similarity.compute_similarity(sent1, real)
